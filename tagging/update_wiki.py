@@ -2,22 +2,50 @@
 # Copyright (c) Jupyter Development Team.
 # Distributed under the terms of the Modified BSD License.
 import argparse
+import datetime
 import logging
 import shutil
 from pathlib import Path
 
+import plumbum
+from dateutil import relativedelta
+
+git = plumbum.local["git"]
+
 LOGGER = logging.getLogger(__name__)
+
+YEAR_TABLE_HEADER = """\
+## {year}
+
+| Month                  | Builds | Images | Commits |
+| ---------------------- | ------ | ------ | ------- |
+"""
+
+
+def build_monthly_table_line(year_month_file: Path) -> str:
+    year_month_file_content = year_month_file.read_text()
+    images = year_month_file_content.count("Build manifest")
+    builds = sum(
+        "jupyter/base-notebook" in line and "aarch64" not in line
+        for line in year_month_file_content.split("\n")
+    )
+    year_month = year_month_file.stem
+    current_month = datetime.date(
+        year=int(year_month[:4]), month=int(year_month[5:]), day=1
+    )
+    next_month = current_month + relativedelta.relativedelta(months=1)
+    future = (
+        git["log", "--oneline", "--since", current_month, "--until", next_month]
+        & plumbum.BG
+    )
+    future.wait()
+    commits = len(future.stdout.splitlines())
+
+    return f"| [`{year_month}`](./{year_month}) | {builds: <6} | {images: <6} | {commits: <7} |\n"
 
 
 def regenerate_home_wiki_page(wiki_dir: Path) -> None:
     YEAR_MONTHLY_TABLES = "<!-- YEAR_MONTHLY_TABLES -->\n"
-
-    YEAR_TABLE_HEADER = """\
-## {year}
-
-| Month                  | Builds | Images |
-| ---------------------- | ------ | ------ |
-"""
 
     wiki_home_file = wiki_dir / "Home.md"
     wiki_home_content = wiki_home_file.read_text()
@@ -27,22 +55,10 @@ def regenerate_home_wiki_page(wiki_dir: Path) -> None:
         : wiki_home_content.find(YEAR_MONTHLY_TABLES) + len(YEAR_MONTHLY_TABLES)
     ]
 
-    all_year_dirs = sorted((wiki_dir / "monthly-files").glob("*"), reverse=True)
-    for year_dir in all_year_dirs:
+    for year_dir in sorted((wiki_dir / "monthly-files").glob("*"), reverse=True):
         wiki_home_content += "\n" + YEAR_TABLE_HEADER.format(year=year_dir.name)
-
-        all_year_month_files = sorted(year_dir.glob("*.md"), reverse=True)
-        for year_month_file in all_year_month_files:
-            year_month_file_content = year_month_file.read_text()
-            images = year_month_file_content.count("Build manifest")
-            builds = sum(
-                "jupyter/base-notebook" in line and "aarch64" not in line
-                for line in year_month_file_content.split("\n")
-            )
-            year_month = year_month_file.stem
-            wiki_home_content += (
-                f"| [`{year_month}`](./{year_month}) | {builds: <6} | {images: <6} |\n"
-            )
+        for year_month_file in sorted(year_dir.glob("*.md"), reverse=True):
+            wiki_home_content += build_monthly_table_line(year_month_file)
 
     wiki_home_file.write_text(wiki_home_content)
     LOGGER.info("Updated Home page")
@@ -102,11 +118,14 @@ def remove_old_manifests(wiki_dir: Path) -> None:
         LOGGER.info(f"Removed manifest: {file.relative_to(wiki_dir)}")
 
 
-def update_wiki(wiki_dir: Path, hist_lines_dir: Path, manifests_dir: Path) -> None:
+def update_wiki(
+    wiki_dir: Path, hist_lines_dir: Path, manifests_dir: Path, allow_no_files: bool
+) -> None:
     LOGGER.info("Updating wiki")
 
     manifest_files = list(manifests_dir.rglob("*.md"))
-    assert manifest_files, "expected to have some manifest files"
+    if not allow_no_files:
+        assert manifest_files, "expected to have some manifest files"
     for manifest_file in manifest_files:
         year_month = get_manifest_year_month(manifest_file)
         year = year_month[:4]
@@ -116,7 +135,10 @@ def update_wiki(wiki_dir: Path, hist_lines_dir: Path, manifests_dir: Path) -> No
         LOGGER.info(f"Added manifest file: {copy_to.relative_to(wiki_dir)}")
 
     build_history_line_files = sorted(hist_lines_dir.rglob("*.txt"))
-    assert build_history_line_files, "expected to have some build history line files"
+    if not allow_no_files:
+        assert (
+            build_history_line_files
+        ), "expected to have some build history line files"
     for build_history_line_file in build_history_line_files:
         build_history_line = build_history_line_file.read_text()
         assert build_history_line.startswith("| `")
@@ -149,6 +171,13 @@ if __name__ == "__main__":
         type=Path,
         help="Directory with manifest files",
     )
+    arg_parser.add_argument(
+        "--allow-no-files",
+        action="store_true",
+        help="Allow no manifest or history line files",
+    )
     args = arg_parser.parse_args()
 
-    update_wiki(args.wiki_dir, args.hist_lines_dir, args.manifests_dir)
+    update_wiki(
+        args.wiki_dir, args.hist_lines_dir, args.manifests_dir, args.allow_no_files
+    )
